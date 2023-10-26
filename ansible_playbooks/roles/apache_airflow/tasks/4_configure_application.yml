@@ -1,0 +1,57 @@
+---
+- name: Copy application to dag directory
+  template:
+    src: "virtual_disk_to_oci_block_volume.py.j2"
+    dest: "{{ ansible_env.HOME }}/apache-airflow/dags/virtual_disk_to_oci_block_volume.py"
+    variable_start_string: "{!!"
+    variable_end_string: "!!}"
+
+- name: Add required variables to Apache Airflow
+  uri:
+    url: http://localhost:8080/api/v1/variables
+    method: POST
+    user: "{{ apache_airflow_admin_user }}"
+    password: "{{ apache_airflow_admin_pass }}"
+    force_basic_auth: true
+    headers:
+      Accept: 'application/json'
+      Content-Type: 'application/json'
+    body_format: "json"
+    body: "{ \"description\": \"{{ item.description }}\", \"key\": \"{{ item.key }}\", \"value\": \"{{ item.value }}\" }"
+  loop:
+    - { key: 'compartment_id', value: "{{ compartment_id }}", description: "Compartment ID where to create conversion instance"}
+    - { key: 'subnet_id', value: "{{ subnet_id }}", description: "Subnet ID that conversion instance will attach to"}
+    - { key: 'instance_shape', value: "{{ instance_shape }}", description: "Conversion instance shape"}
+    - { key: 'instance_ocpus', value: "{{ instance_ocpus }}", description: "Conversion instance OCPUs"}
+    - { key: 'instance_memory_in_gbs', value: "{{ instance_memory_in_gbs }}", description: "Conversion instance Memory in GBs"}
+    - { key: 'instance_image_id', value: "{{ instance_image_id }}", description: "Conversion instance boot image"}
+    - { key: 'backup_policy_id', value: "{{ backup_policy_id }}", description: "Should enable backup policy for new imported block volume? If yes, provide the backup policy OCID."}    
+    - { key: 'ssh_pub_key', value: "{{ ssh_pub_key }}", description: "BASE64 encoded publick key used to access the conversion instance."}
+    - { key: 'ssh_priv_key', value: "{{ ssh_priv_key }}", description: "BASE64 encoded private key used to access the conversion instance."}
+    - { key: 'cloud_init', value: "{{ cloud_init }}", description: "BASE64 encoded cloud-init script used with conversion instance."}
+    - { key: 'ssh_username', value: "{{ ansible_user }}", description: "Username to use for ssh authentication to conversion instance."}
+    - { key: 'defined_tag_key', value: "{{ defined_tag_key }}", description: "Defined tag key to attach to the conversion instance."}
+    - { key: 'defined_tag_value', value: "{{ defined_tag_value }}", description: "Defined tag value to attach to the conversion instance."}
+  register: variable_add_results
+
+- name: Start services output
+  ansible.builtin.debug:
+    var: variable_add_results
+
+- name: Enable Apache Airflow DAG
+  uri:
+    url: http://localhost:8080/api/v1/dags/1_virtual_disk_to_oci_block_volume
+    method: PATCH
+    user: "{{ apache_airflow_admin_user }}"
+    password: "{{ apache_airflow_admin_pass }}"
+    force_basic_auth: true
+    headers:
+      Accept: 'application/json'
+      Content-Type: 'application/json'
+    body_format: "json"
+    body: "{ \"is_paused\": false }"
+  register: dag_enable_result
+ 
+- name: Enable Apache Airflow DAG result
+  ansible.builtin.debug:
+    var: dag_enable_result

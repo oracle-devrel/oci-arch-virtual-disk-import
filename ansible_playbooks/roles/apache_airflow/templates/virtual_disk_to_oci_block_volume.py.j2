@@ -1,0 +1,979 @@
+import base64, re
+from datetime import datetime
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.python_operator import PythonVirtualenvOperator
+from airflow.exceptions import AirflowSkipException
+
+
+default_args = {
+    'owner': '{!! apache_airflow_admin_user !!}',
+    'depends_on_past': False,
+    'start_date': datetime(2022, 1, 1),
+    'catchup': False,
+    'params': {
+        'bucket_name': 'default-bucket', 
+        'object_name': 'image.vhdx',
+        'ad_number': 0
+        }
+}
+
+with DAG(
+    '1_virtual_disk_to_oci_block_volume',
+    render_template_as_native_obj=True,
+    default_args=default_args,
+    schedule=None, 
+) as dag:
+
+
+    #####################################################
+    ################ Get file metadata ##################
+    #####################################################
+    def get_file_head(params):
+        """
+        Attempt to get the object head parameters.
+
+        Required parameters:
+        
+        params                 (dict)  : Details of the object which requires conversion. (bucket_name/object_name)
+        """
+        import json
+        import oci
+
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        os_client = oci.object_storage.ObjectStorageClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+
+        bucket_name = params["bucket_name"]
+        object_name = params["object_name"]
+
+        # Fetch namespace
+        os_client_response = os_client.get_namespace()
+        if os_client_response.status == 200:
+            namespace = os_client_response.data
+        else:
+            raise Exception(f"Couldn't fetch namespace; status {os_client_response.status} data: {os_client_response.data}")
+
+        # Fetch object head
+        os_client_response = os_client.head_object(namespace_name=namespace, bucket_name=bucket_name, object_name=object_name)
+        if os_client_response.status == 200:
+            obj_headers = os_client_response.headers
+        else:
+            raise Exception(f"Couldn't fetch object head; status {os_client_response.status} data: {os_client_response.data}")
+
+        obj_head = { k: v for k, v in obj_headers.items() }
+        return obj_head
+
+
+    #####################################################
+    ################ Create instance ####################
+    #####################################################
+    def create_instance(compartment_id, ssh_pub_key, subnet_id, instance_shape, instance_ocpus, instance_memory_in_gbs, instance_image_id, cloud_init="", freeform_tags={}, defined_tags={}, obj_head={}, params={}):
+        """
+        Create a new instance for the image conversion task.
+        
+        Required parameters:
+        
+        compartment_id         (string): OCID of compartment where to create the instance.
+        ssh_pub_key            (string): Public SSH key.
+        subnet_id              (string): OCID of the subnet id where the instance VNIC should be attached.
+        instance_shape         (string): Shape of the instance to be used. Only Flex VM shapes are supported (if other instance shapes are provided, OCI API call may fail.)
+        instance_ocpus         (int)   : Number of OCPUs to allocate to the instance.
+        instance_memory_in_gbs (int)   : Amount of RAM memory to allocate to the instance in GB.
+        instance_image_id      (string): OCID of the image to be used as source. Custom image should have oci-cli and qemu-img tools preinstalled.
+        freeform_tags          (dict)  : Dictionary with key/value pairs to be used as freeform tags for the instance.
+        defined_tags           (dict)  : Dictionary with key/value pairs to be used as defined tags for the instance.
+
+        Optional parameters:
+        cloud_init             (string): base64 encoded cloud-init script.
+        obj_head               (dict)  : Dictionary with object head.
+        params                 (dict)  : Dictionary where extra attributes can be provided (ad_number - to select ad_number)
+        """
+        import oci
+        import random
+        import re
+        import string
+
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+
+        # Check if ad_number is provided in params dictionary
+        ad_number = int(params.get('ad_number', 0))
+
+        # Compute required space to download file from OS
+        file_size = int(obj_head['Content-Length'])
+        required_space = int(file_size/pow(10, 9)) + 1
+        if required_space > 20:
+            boot_volume_size_in_gbs = 30 + required_space
+        else:
+            boot_volume_size_in_gbs = 50
+        
+        metadata = {}
+        if ssh_pub_key != None: 
+            metadata["ssh_authorized_keys"] = ssh_pub_key
+        if cloud_init:
+            metadata["user_data"] = cloud_init
+        else:
+            metadata["user_data"] = "IyEvYmluL2Jhc2gKCi91c3IvbGliZXhlYy9vY2ktZ3Jvd2ZzIC15CgpkbmYgY29uZmlnLW1hbmFnZXIgLS1lbmFibGUgb2w4X2t2bV9hcHBzdHJlYW0KZG5mIG1vZHVsZSBlbmFibGUgLXkgdmlydDprdm1fdXRpbHMzCmRuZiBpbnN0YWxsIC15IHFlbXUtaW1nCgpzdWRvIHBpcDMgaW5zdGFsbCBvY2ktY2xpCg==" #base64 encoded: #!/bin/bash\n/usr/libexec/oci-growfs -y
+
+        for k in obj_head:
+            if k.startswith('opc-meta-'):
+                freeform_tags[k.replace('opc-meta-','')] = obj_head[k]
+
+        # Get availability domains available in the region and select desired ad
+        identity_client = oci.identity.IdentityClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        list_availability_domains_response = identity_client.list_availability_domains(
+            compartment_id=compartment_id)
+        ads = [ad.name for ad in list_availability_domains_response.data]
+        if ad_number != 0:
+            availability_domain = ads[ad_number - 1]
+        else:
+            availability_domain = random.choice(ads)
+
+        # Generate instance display-name
+        random_suffix = ''.join(random.choices(string.ascii_lowercase+string.digits, k=3))
+        if 'display_name' in freeform_tags:
+            temp_display_name = freeform_tags['display_name']
+            safe_display_name = re.sub(r"\W","",temp_display_name.lower())
+            display_name = f"{safe_display_name}-{random_suffix}"
+        else:
+            display_name = f"convert-{random_suffix}"
+        
+        # Call to OCI API to create instance
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        launch_instance_response = compute_client.launch_instance(
+            launch_instance_details=oci.core.models.LaunchInstanceDetails(
+                agent_config=oci.core.models.LaunchInstanceAgentConfigDetails(
+                    is_monitoring_disabled=False,
+                    is_management_disabled=False,
+                    are_all_plugins_disabled=False,
+                    plugins_config=[
+                        oci.core.models.InstanceAgentPluginConfigDetails(
+                            name="OS Management Service Agent",
+                            desired_state="DISABLED"
+                        ),
+                    ]
+                ),
+                availability_domain=availability_domain,
+                compartment_id=compartment_id,
+                display_name=display_name,
+                freeform_tags=freeform_tags,
+                defined_tags=defined_tags,
+                shape=instance_shape,
+                shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                    ocpus=int(instance_ocpus),
+                    memory_in_gbs=int(instance_memory_in_gbs)
+                ),
+                create_vnic_details=oci.core.models.CreateVnicDetails(
+                    assign_public_ip=False,
+                    subnet_id=subnet_id,
+                ),
+                source_details=oci.core.models.InstanceSourceViaImageDetails(
+                    boot_volume_size_in_gbs=boot_volume_size_in_gbs,
+                    image_id=instance_image_id,
+                    source_type='image'),
+                metadata=metadata,
+            )
+        )
+
+        # Return instance details
+        instance_details = {
+            'instance_id': launch_instance_response.data.id,
+            'instance_ad': availability_domain,
+            'instance_compartment_id':  compartment_id
+        }
+        return instance_details
+
+
+    #####################################################
+    ################# Get instance ip ###################
+    #####################################################
+    def get_private_ip(compartment_id, instance_details):
+        """
+        Attempt to get the instance private_ip address.
+
+        Required parameters:
+        
+        compartment_id         (string): OCID of compartment where to create the instance.
+        instance_details       (dict)  : Instance_details dictionary (returned by the create_instance function).
+        """
+        import oci
+        import time
+        import json
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        
+        instance_id = instance_details.get('instance_id')
+
+        list_vnic_attachments = compute_client.list_vnic_attachments(
+            compartment_id=compartment_id, 
+            instance_id=instance_id)
+        retry = 1
+
+        # Retry up to 5 minutes waiting 30 seconds between attempts.
+        while not len(list_vnic_attachments.data):
+            time.sleep(30)
+            list_vnic_attachments = compute_client.list_vnic_attachments(
+                compartment_id=compartment_id, 
+                instance_id=instance_id
+            )
+            retry += 1
+            if retry > 5:
+                break
+
+        vnic_id = list_vnic_attachments.data[0].vnic_id
+        vn_client = oci.core.VirtualNetworkClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        vn_client_response = vn_client.get_vnic(vnic_id=vnic_id)
+        private_ip = vn_client_response.data.private_ip
+        
+        # Append to instance_details dictionary the instance_private_ip key.
+        instance_details['instance_private_ip'] = private_ip
+        return instance_details
+
+    #####################################################
+    ############ Wait cloud-init execution ##############
+    #####################################################
+    def wait_cloud_init_execution(ssh_username, instance_details, private_key, cloud_init=""):
+        import json, socket, tempfile, time
+        from ssh2.session import Session
+        import sys
+
+        import timeout_decorator
+
+        if not cloud_init:
+            print('No custom cloud-init script provided')
+
+        fp = tempfile.NamedTemporaryFile()
+        fp.file.write(bytes(private_key,"utf-8"))
+        fp.flush()
+
+        instance_ip = instance_details.get('instance_private_ip')
+        print(f"Initiating SSH connection to temporary machine: {instance_ip}")
+        max_retries = 20
+        retries = 0
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((instance_ip, 22))
+                break
+            except socket.error:
+                print ("Connection Failed, Retrying in 30 seconds..")
+                time.sleep(30)
+            retries +=1
+            if retries == max_retries:
+                raise Exception(f'Could not open socket to {instance_ip} on port 22')
+        
+        def run_ssh_session(sock, ssh_username, fp):
+            s = Session()
+            s.handshake(sock)
+            s.userauth_publickey_fromfile(ssh_username, fp.name)
+            print(f'SSH Connection successfuly established')
+
+            # Check if cloud-init execution is done.
+            print(f'Waiting for the cloud-init execution to finish...')
+            chan = s.open_session()
+            chan.execute(f"cloud-init status --wait")
+            chan.wait_eof()
+            chan.close()
+            chan.wait_closed()
+
+            output = b''
+            size, data = chan.read()
+            while size > 0:
+                output += data
+                size, data = chan.read()
+
+            exit_status = chan.get_exit_status()
+            if exit_status != 0:
+                stderr = b''
+                size, data = chan.read_stderr()
+                while size > 0:
+                    stderr += data
+                    size, data = chan.read_stderr()
+                print (f"cloud-init status' command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+            else:
+                print(f"'cloud-init status' command executed successfuly: {output.decode('UTF-8')}")
+
+            return exit_status
+        
+        @timeout_decorator.timeout(600)
+        def wait_for_cloud_init_with_timeout():
+            try:
+                exit_status = run_ssh_session(sock, ssh_username, fp)
+                if exit_status != 0:
+                    raise Exception(f'The cloud-init has not executed successfuly.')
+            except timeout_decorator.TimeoutError:
+                raise Exception(f'The cloud-init execution has not completed in 10 minutes.')
+
+        wait_for_cloud_init_with_timeout()
+
+
+    #####################################################
+    ############ Download image from bucket #############
+    #####################################################
+    def download_image_from_bucket(ssh_username, instance_details, private_key, params):
+        import json, socket, tempfile, time
+        from ssh2.session import Session
+
+        fp = tempfile.NamedTemporaryFile()
+        fp.file.write(bytes(private_key,"utf-8"))
+        fp.flush()
+
+        instance_ip = instance_details.get('instance_private_ip')
+        print(f"Initiating SSH connection to temporary machine: {instance_ip}")
+        max_retries = 20
+        retries = 0
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((instance_ip, 22))
+                break
+            except socket.error:
+                print ("Connection Failed, Retrying in 30 seconds..")
+                time.sleep(30)
+            retries +=1
+            if retries == max_retries:
+                raise Exception(f'Could not open socket to {instance_ip} on port 22')
+
+        s = Session()
+        s.handshake(sock)
+        s.userauth_publickey_fromfile(ssh_username, fp.name)
+        print(f'SSH Connection successfuly established')
+
+        bucket_name = params["bucket_name"]
+        object_name = params["object_name"]
+
+        # Downloading object from bucket
+        print(f'Downloading Object from bucket |  bn: {bucket_name} object: {object_name}')
+        chan = s.open_session()
+        chan.execute(f"rm -rf image.source; oci os object get -bn {bucket_name} --name '{object_name}' --file image.source --auth instance_principal")
+        chan.wait_eof()
+        chan.close()
+        chan.wait_closed()
+
+        output = b''
+        size, data = chan.read()
+        while size > 0:
+            output += data
+            size, data = chan.read()
+
+        exit_status = chan.get_exit_status()
+        if exit_status != 0:
+            stderr = b''
+            size, data = chan.read_stderr()
+            while size > 0:
+                stderr += data
+                size, data = chan.read_stderr()
+            print (f"Command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+            raise Exception(f"Could not download {object_name} from {bucket_name}")
+
+
+        # Get image virtual-size
+        print(f'Getting image file information')
+        chan = s.open_session()
+        chan.execute("qemu-img info image.source --output json")
+        chan.wait_eof()
+        chan.close()
+        chan.wait_closed()
+        output = b''
+        size, data = chan.read()
+        while size > 0:
+            output += data
+            size, data = chan.read()
+
+        exit_status = chan.get_exit_status()
+        if exit_status != 0:
+            stderr = b''
+            size, data = chan.read_stderr()
+            while size > 0:
+                stderr += data
+                size, data = chan.read_stderr()
+            print (f"Command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+            raise Exception(f"Could not get image file information")
+        
+        print(f'Image file information: {output.decode("UTF-8")}')
+        image_info = json.loads(output.decode('UTF-8'))
+        return image_info
+
+
+    #####################################################
+    ############### Create block volume #################
+    #####################################################
+    def create_block_volume(instance_details, image_info, obj_head, params):
+        import oci
+        import time
+        import re
+        
+        object_name = params["object_name"]
+        virtual_size = int(image_info['virtual-size'])
+
+        if virtual_size < 50*pow(10, 9):
+            bv_size_gbs = 50
+        else:
+            bv_size_gbs = int(virtual_size/pow(10, 9)) + 1
+
+        freeform_tags = {}
+        for k in obj_head:
+            if k.startswith('opc-meta-'):
+                freeform_tags[k.replace('opc-meta-','')] = obj_head[k]
+        
+        display_name = re.sub(r"\W","", object_name.split('/')[-1])
+
+        print(f'Attempt to create new BV named {display_name}, with a size of {bv_size_gbs} GB and tags: {freeform_tags}')
+        
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        bv_client = oci.core.BlockstorageClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        create_bv_response = bv_client.create_volume(
+             create_volume_details=oci.core.models.CreateVolumeDetails(
+                compartment_id=instance_details['instance_compartment_id'],
+                availability_domain=instance_details['instance_ad'],
+                display_name=display_name,
+                freeform_tags=freeform_tags,
+                vpus_per_gb=20,
+                size_in_gbs=bv_size_gbs,
+            )
+        )
+
+        if create_bv_response.status == 200:
+            bv_id = create_bv_response.data.id
+            print(f'Successfuly created block volume {bv_id}')
+        else:
+            raise Exception(f"Couldn't create new Block Volume; status {create_bv_response.status} data: {create_bv_response.data}")
+
+        # Retry up to 10 minutes waiting 30 seconds between attempts.
+        bv_available = False
+        retry = 1
+        max_retries = 20
+        while not bv_available:
+            time.sleep(30)
+            get_volume_response = bv_client.get_volume(
+                volume_id=bv_id
+            )
+            if get_volume_response.data.lifecycle_state == 'AVAILABLE':
+                bv_available = True
+                print(f'Block volume {bv_id} is available.')
+            retry += 1
+            if retry > max_retries:
+                raise Exception(f'Block volume {bv_id} not available in 10 minutes')
+        return bv_id
+
+
+    #####################################################
+    ############### Attach block volume #################
+    #####################################################
+    def attach_block_volume(instance_details, bv_id):
+        import oci
+        import time
+        
+        print(f'Attempt to attach block volume {bv_id}, to instance: {instance_details["instance_id"]}')
+        
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+
+        # Attach BV to the instance
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        attach_volume_response = compute_client.attach_volume(
+            attach_volume_details=oci.core.models.AttachIScsiVolumeDetails(
+                type="paravirtualized",
+                instance_id=instance_details["instance_id"],
+                volume_id=bv_id,
+                device="/dev/oracleoci/oraclevdb",
+                is_read_only=False,
+                is_shareable=False,
+                )
+            )
+
+        if attach_volume_response.status == 200:
+            attach_id = attach_volume_response.data.id
+            print(f'Successfuly attached block volume {bv_id} to instance: {instance_details["instance_id"]}')
+        else:
+            raise Exception(f"Couldn't not attach block volume {bv_id} to instance: {instance_details['instance_id']}; status {attach_volume_response.status} data: {attach_volume_response.data}")
+        
+        return attach_id
+
+
+    #####################################################
+    ######## Wait for block volume attachment ###########
+    #####################################################
+    def wait_for_attachment(bv_id, attach_id):
+        import oci
+        import time
+
+        print(f'Waiting for Block Volume attachment state to become "ATTACHED"')
+        
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        # Retry up to 10 minutes waiting 30 seconds between attempts.
+        volume_attached = False
+        retry = 1
+        max_retries = 20
+        while not volume_attached:
+            time.sleep(30)
+            get_attach_volume_response = compute_client.get_volume_attachment(
+                volume_attachment_id=attach_id
+            )
+            if get_attach_volume_response.data.lifecycle_state == 'ATTACHED':
+                volume_attached = True
+                print(f'Block volume successfuly attached.')
+            retry += 1
+            if retry > max_retries:
+                raise Exception(f'Block Volume {bv_id} attachment state has not become not "ATTACHED" in 10 minutes.')
+
+
+    #####################################################
+    ########## Write image to block volume ##############
+    #####################################################
+    def write_image_to_bv(ssh_username, instance_details, private_key, bv_id, image_info):
+        import json, socket, tempfile, time
+        from ssh2.session import Session
+
+        fp = tempfile.NamedTemporaryFile()
+        fp.file.write(bytes(private_key,"utf-8"))
+        fp.flush()
+
+        instance_ip = instance_details.get('instance_private_ip')
+        print(f"Initiating SSH connection to temporary machine: {instance_ip} ")
+        max_retries = 20
+        retries = 0
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((instance_ip, 22))
+                break
+            except socket.error:
+                print ("Connection Failed, Retrying in 30 seconds..")
+                time.sleep(30)
+            retries +=1
+            if retries == max_retries:
+                raise Exception(f'Could not open socket to {instance_ip} on port 22')
+
+        s = Session()
+        s.handshake(sock)
+        s.userauth_publickey_fromfile(ssh_username, fp.name)
+        print(f'SSH Connection successfuly established')
+
+        # Write image to Block volume
+        print(f'Writing image to block volume {bv_id}')
+        chan = s.open_session()
+        chan.execute(f"sudo qemu-img convert -f {image_info.get('format')} -O host_device image.source /dev/oracleoci/oraclevdb")
+        chan.wait_eof()
+        chan.close()
+        chan.wait_closed()
+        output = b''
+        size, data = chan.read()
+        while size > 0:
+            output += data
+            size, data = chan.read()
+
+        exit_status = chan.get_exit_status()
+        if exit_status != 0:
+            stderr = b''
+            size, data = chan.read_stderr()
+            while size > 0:
+                stderr += data
+                size, data = chan.read_stderr()
+            print (f"Command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+            raise Exception(f"Could not write the image ({', '.join([str(k)+' : '+str(v) for k, v in image_info.items()])}) to block volume {bv_id}")
+        
+        print('qemu-img command was executed successfuly\n', output.decode('UTF-8'))
+
+
+        # Run sync
+        print(f'Run sync')
+        chan = s.open_session()
+        chan.execute(f"sudo sync")
+        chan.wait_eof()
+        chan.close()
+        chan.wait_closed()
+        output = b''
+        size, data = chan.read()
+        while size > 0:
+            output += data
+            size, data = chan.read()
+
+        exit_status = chan.get_exit_status()
+        if exit_status != 0:
+            stderr = b''
+            size, data = chan.read_stderr()
+            while size > 0:
+                stderr += data
+                size, data = chan.read_stderr()
+            print (f"Command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+            raise Exception(f"Could not execute sync")
+        
+    #####################################################
+    ############## FSCK on block volume #################
+    #####################################################
+    def fsck_on_block_volume(ssh_username, instance_details, private_key, bv_id):
+        import json, socket, tempfile, time
+        from ssh2.session import Session
+
+        fp = tempfile.NamedTemporaryFile()
+        fp.file.write(bytes(private_key,"utf-8"))
+        fp.flush()
+
+        instance_ip = instance_details.get('instance_private_ip')
+        print(f"Initiating SSH connection to temporary machine: {instance_ip} ")
+        max_retries = 20
+        retries = 0
+        while True:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((instance_ip, 22))
+                break
+            except socket.error:
+                print ("Connection Failed, Retrying in 30 seconds..")
+                time.sleep(30)
+            retries +=1
+            if retries == max_retries:
+                raise Exception(f'Could not open socket to {instance_ip} on port 22')
+
+        s = Session()
+        s.handshake(sock)
+        s.userauth_publickey_fromfile(ssh_username, fp.name)
+        print(f'SSH Connection successfuly established')
+
+        # Run fsck
+        print(f'Run fsck on /dev/oracleoci/oraclevdb')
+        chan = s.open_session()
+        chan.execute(f"sudo fsck -n /dev/oracleoci/oraclevdb")
+        chan.wait_eof()
+        chan.close()
+        chan.wait_closed()
+        output = b''
+        size, data = chan.read()
+        while size > 0:
+            output += data
+            size, data = chan.read()
+        size, data = chan.read_stderr()
+
+        exit_status = chan.get_exit_status()
+        if exit_status != 0:
+            stderr = b''
+            size, data = chan.read_stderr()
+            while size > 0:
+                stderr += data
+                size, data = chan.read_stderr()
+            print (f"Command returned exit_status: {exit_status} and error: {stderr.decode('UTF-8')}")
+        
+        print('fsck output:', output.decode('UTF-8'))
+
+    #####################################################
+    ############### Detach block volume #################
+    #####################################################
+    def detach_block_volume(instance_details, bv_id, attach_id):
+
+        import oci
+        import time
+        
+        print(f'Attempt to detach block volume {bv_id}, from instance: {instance_details["instance_id"]}')
+        
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+
+        # Attach BV to the instance
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        detach_volume_response = compute_client.detach_volume(
+            volume_attachment_id=attach_id
+            )
+        
+        print(f'Detach request response: {detach_volume_response.status}')
+        
+        # Retry up to 10 minutes waiting 30 seconds between attempts.
+        volume_detached = False
+        retry = 1
+        max_retries = 20
+        while not volume_detached:
+            time.sleep(30)
+            get_attach_volume_response = compute_client.get_volume_attachment(
+                volume_attachment_id=attach_id
+            )
+            if get_attach_volume_response.data.lifecycle_state == 'DETACHED':
+                volume_detached = True
+                print(f'Block volume {bv_id} successfuly detached.')
+            retry += 1
+            if retry > max_retries:
+                raise Exception(f'Could not detach block volume {bv_id} from instance: {instance_details["instance_id"]} in 10 minutes.')
+        
+        return True
+
+
+    #####################################################
+    ################# Terminate instance ##################
+    #####################################################
+    def terminate_instance(instance_details):
+        """
+        #### Terminate processing instance
+        """
+        import oci
+        
+        instance_id = instance_details.get('instance_id')
+        
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        
+        compute_client = oci.core.ComputeClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)   
+        terminate_instance_response = compute_client.terminate_instance(
+            instance_id=instance_id,
+            preserve_boot_volume=False
+        )
+        
+        print(f'Instance termination response: {terminate_instance_response.status} for {instance_id}')
+        
+        return True
+
+
+    #####################################################
+    ########## Update performance of the bv #############
+    #####################################################
+    def update_performance_of_bv(bv_id):
+        """
+        #### Activate backup policy on block volume
+        """
+        import oci
+        import sys
+
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        core_client = oci.core.BlockstorageClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        update_block_volume_performance_response = core_client.update_volume(
+            volume_id=bv_id,
+            update_volume_details=oci.core.models.UpdateVolumeDetails(
+                vpus_per_gb=10))
+        print("Block volume performance update response:", update_block_volume_performance_response.data)
+        return True           
+
+
+    #####################################################
+    ########## Activate backup policy on bv #############
+    #####################################################
+    def setup_backup_policy(bv_id, backup_policy_id):
+        """
+        #### Activate backup policy on block volume
+        """
+        import oci
+        import sys
+
+        if not backup_policy_id:
+            print('No backup policy configured. Skipping this step.')
+            sys.exit(61)
+
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        core_client = oci.core.BlockstorageClient({}, signer=signer, retry_strategy=oci.retry.DEFAULT_RETRY_STRATEGY)
+        create_volume_backup_policy_assignment_response = core_client.create_volume_backup_policy_assignment(
+            create_volume_backup_policy_assignment_details=oci.core.models.CreateVolumeBackupPolicyAssignmentDetails(
+                asset_id=bv_id,
+                policy_id=backup_policy_id))
+        print("Block Volume backup policy assignment response", create_volume_backup_policy_assignment_response.data)
+        return True            
+
+
+
+    #########################################
+    ######### Task initialization ###########
+    #########################################
+    compartment_id = Variable.get("compartment_id", "")
+    ssh_pub_key = Variable.get("ssh_pub_key", "")
+    ssh_priv_key = Variable.get("ssh_priv_key", "")
+    subnet_id = Variable.get("subnet_id", "")
+    instance_shape = Variable.get("instance_shape", "")
+    instance_ocpus = Variable.get("instance_ocpus", "")
+    instance_memory_in_gbs = Variable.get("instance_memory_in_gbs", "")
+    instance_image_id = Variable.get("instance_image_id", "")
+    backup_policy_id = Variable.get("backup_policy_id", "")
+    cloud_init = Variable.get("cloud_init", "")
+    ssh_username = Variable.get("ssh_username", "opc")
+    defined_tag_key = Variable.get("defined_tag_key", "tag_namespace.tag_key")
+    defined_tag_value = Variable.get("defined_tag_value", "tag_value")
+    
+    try:
+        tag_namespace = defined_tag_key.split(".")[0]
+        tag_key = defined_tag_key.split(".")[1]
+        defined_tags = {  tag_namespace: { tag_key: defined_tag_value } }
+
+    except Exception as e:
+        print("Invalid defined tag provided")
+        defined_tags = {}
+
+    # Check if ssh_pub_key is base64 encoded
+    match = re.match(r'^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)?$', ssh_pub_key)
+    if match:
+        ssh_pub_key = base64.b64decode(ssh_pub_key).decode('utf-8')
+    
+    # Check if ssh_priv_key is base64 encoded
+    match = re.match(r'^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)?$', ssh_priv_key)
+    if match:
+        ssh_priv_key = base64.b64decode(ssh_priv_key).decode('utf-8')
+
+    t_get_file_head = PythonVirtualenvOperator(
+        task_id='get_file_head',
+        dag=dag,
+        python_callable=get_file_head,
+        op_kwargs={
+            "params": "{{ params }}"
+        },
+        requirements=["oci"]
+    )
+
+    t_create_instance = PythonVirtualenvOperator(
+        task_id='create_instance',
+        dag=dag,
+        python_callable=create_instance,
+        op_kwargs={
+            "compartment_id": compartment_id,
+            "ssh_pub_key": ssh_pub_key,
+            "subnet_id": subnet_id,
+            "instance_shape": instance_shape,
+            "instance_ocpus": instance_ocpus,
+            "instance_memory_in_gbs": instance_memory_in_gbs,
+            "instance_image_id": instance_image_id,
+            "freeform_tags": {"instance_role": "write_disk_image_to_block_volume"},
+            "defined_tags": defined_tags,
+            "cloud_init": cloud_init,
+            "obj_head": '{{ ti.xcom_pull(task_ids="get_file_head") }}',
+            "params": "{{ params }}"
+        },
+        requirements=["oci"]
+    )
+
+    t_get_private_ip = PythonVirtualenvOperator(
+        task_id='get_private_ip',
+        dag=dag,
+        op_kwargs={
+            'instance_details': '{{ ti.xcom_pull(task_ids="create_instance") }}',
+            'compartment_id': compartment_id
+        },
+        python_callable=get_private_ip,
+        requirements=["oci"]
+    )
+
+    t_wait_cloud_init_execution = PythonVirtualenvOperator(
+        task_id='wait_cloud_init_execution',
+        dag=dag,
+        op_kwargs={
+            'ssh_username': ssh_username,
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'private_key': ssh_priv_key,
+            'cloud_init': cloud_init
+        },
+        python_callable=wait_cloud_init_execution,
+        requirements=["ssh2-python", "timeout_decorator"]
+    )
+
+    t_download_image_from_bucket = PythonVirtualenvOperator(
+        task_id='download_image_from_bucket',
+        dag=dag,
+        op_kwargs={
+            'ssh_username': ssh_username,
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'private_key': ssh_priv_key,
+            'params': "{{ params }}"
+        },
+        python_callable=download_image_from_bucket,
+        requirements=["ssh2-python"]
+    )
+
+    t_create_block_volume = PythonVirtualenvOperator(
+        task_id='create_block_volume',
+        dag=dag,
+        op_kwargs={
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'image_info': '{{ ti.xcom_pull(task_ids="download_image_from_bucket") }}',
+            "obj_head": '{{ ti.xcom_pull(task_ids="get_file_head") }}',
+            'params': "{{ params }}"
+        },
+        python_callable=create_block_volume,
+        requirements=["oci"]
+    )
+
+    t_attach_block_volume = PythonVirtualenvOperator(
+        task_id='attach_block_volume',
+        dag=dag,
+        op_kwargs={
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}'
+        },
+        python_callable=attach_block_volume,
+        requirements=["oci"]
+    )
+
+    t_wait_for_attachment = PythonVirtualenvOperator(
+        task_id='wait_for_attachment',
+        dag=dag,
+        op_kwargs={
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}',
+            'attach_id': '{{ ti.xcom_pull(task_ids="attach_block_volume") }}'
+        },
+        python_callable=wait_for_attachment,
+        requirements=["oci"]
+    )
+
+    t_write_image_to_bv = PythonVirtualenvOperator(
+        task_id='write_image_to_bv',
+        dag=dag,
+        op_kwargs={
+            'ssh_username': ssh_username,
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'private_key': ssh_priv_key,
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}',
+            'image_info': '{{ ti.xcom_pull(task_ids="download_image_from_bucket") }}'
+            },
+        python_callable=write_image_to_bv,
+        requirements=["ssh2-python"]
+    )
+
+    t_fsck_on_block_volume = PythonVirtualenvOperator(
+        task_id='fsck_on_block_volume',
+        dag=dag,
+        op_kwargs={
+            'ssh_username': ssh_username,
+            'instance_details': '{{ ti.xcom_pull(task_ids="get_private_ip") }}',
+            'private_key': ssh_priv_key,
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}'
+            },
+        python_callable=fsck_on_block_volume,
+        requirements=["ssh2-python"]
+        # requirements=["paramiko"]
+    )
+    t_detach_block_volume = PythonVirtualenvOperator(
+        task_id='detach_block_volume',
+        dag=dag,
+        op_kwargs={
+            'instance_details': '{{ ti.xcom_pull(task_ids="create_instance") }}',
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}',
+            'attach_id': '{{ ti.xcom_pull(task_ids="attach_block_volume") }}'
+            },
+        python_callable=detach_block_volume,
+        requirements=["oci"]
+    )
+    
+    t_terminate_instance = PythonVirtualenvOperator(
+        task_id='terminate_instance',
+        dag=dag,
+        op_kwargs={
+            'instance_details': '{{ ti.xcom_pull(task_ids="create_instance") }}'
+            },
+        python_callable=terminate_instance,
+        requirements=["oci"]
+    )
+
+    t_update_performance_of_bv = PythonVirtualenvOperator(
+        task_id='update_performance_of_bv',
+        dag=dag,
+        op_kwargs={
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}',
+            },
+        python_callable=update_performance_of_bv,
+        requirements=["oci"],
+    )
+
+    t_setup_backup_policy = PythonVirtualenvOperator(
+        task_id='setup_backup_policy',
+        dag=dag,
+        op_kwargs={
+            'bv_id': '{{ ti.xcom_pull(task_ids="create_block_volume") }}',
+            'backup_policy_id': backup_policy_id
+            },
+        python_callable=setup_backup_policy,
+        requirements=["oci"],
+        skip_on_exit_code=61
+    )
+    
+    t_get_file_head >> t_create_instance >> t_get_private_ip >> t_wait_cloud_init_execution >> t_download_image_from_bucket >> t_create_block_volume >> t_attach_block_volume >> t_wait_for_attachment >> t_write_image_to_bv >> t_fsck_on_block_volume >> t_detach_block_volume >> t_terminate_instance >> t_update_performance_of_bv >> t_setup_backup_policy

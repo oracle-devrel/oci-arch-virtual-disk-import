@@ -1,0 +1,58 @@
+---
+- name: Create apache-airflow directory
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/apache-airflow"
+    state: directory
+
+- name: Create apache-airflow dags directory
+  ansible.builtin.file:
+    path: "{{ ansible_env.HOME }}/apache-airflow/dags"
+    state: directory
+
+- name: Copy application to dag directory
+  template:
+    src: "virtual_disk_to_oci_block_volume.py.j2"
+    dest: "{{ ansible_env.HOME }}/apache-airflow/dags/virtual_disk_to_oci_block_volume.py"
+    variable_start_string: "{!!"
+    variable_end_string: "!!}"
+
+- name: Fetch Apache Airflow docker-compose file
+  shell: curl https://airflow.apache.org/docs/apache-airflow/2.7.1/docker-compose.yaml --output "{{ ansible_env.HOME }}/apache-airflow/docker-compose.yaml"
+
+- name: Get ansible user info
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ansible_user }}"
+
+- name: Generate .env file
+  lineinfile:
+    create: true
+    dest: "{{ ansible_env.HOME  }}/apache-airflow/.env"
+    regexp: "^{{ item.key | regex_escape() }}="
+    line: "{{ item.key }}={{ item.value }}"
+  loop:
+    - { key: "_AIRFLOW_WWW_USER_USERNAME", value: "{{ apache_airflow_admin_user }}"}
+    - { key: "_AIRFLOW_WWW_USER_PASSWORD", value: "{{ apache_airflow_admin_pass }}"} 
+    - { key: "AIRFLOW_UID", value: "{{ ansible_facts.getent_passwd[ansible_user][1] }}" }
+
+- name: Tear down existing services
+  community.docker.docker_compose:
+    project_src: "{{ ansible_env.HOME  }}/apache-airflow"
+    state: absent
+
+- name: Create and start Apache Airflow services using docker compose
+  community.docker.docker_compose:
+    project_src: "{{ ansible_env.HOME  }}/apache-airflow"
+  register: output
+
+- name: Start services output
+  ansible.builtin.debug:
+    var: output
+
+- name: Check if apache-airflow service is ready
+  shell: curl --silent localhost:8080  | grep -q "Redirecting"
+  register: curl_result
+  until: "curl_result is not failed"
+  retries: 20
+  delay: 15
+

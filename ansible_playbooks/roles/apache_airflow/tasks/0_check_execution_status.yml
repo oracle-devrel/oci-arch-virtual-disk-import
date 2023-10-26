@@ -1,0 +1,12 @@
+---
+- name: Check if apache-airflow directory exists
+  shell: "[ -d {{ ansible_env.HOME }}/apache-airflow ] && echo 'Found' || echo ''"
+  register: already_executed
+
+- name: print value
+  debug:
+    var: already_executed
+
+- name: End play because deployment was already executed
+  meta: end_play
+  when: (already_executed.stdout)

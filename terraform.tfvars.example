@@ -1,0 +1,22 @@
+tenancy_ocid                = "ocid1.tenancy.oc1..adadsasd"
+user_ocid                   = "ocid1.user.oc1..sadadsdsadsa"
+private_key_path            = "/home/user/.oci/oci_api_key.pem"
+private_key_password        = ""
+fingerprint                 = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff"
+region                      = "eu-frankfurt-1"
+deployment_compartment_ocid = "ocid1.compartment.oc1..adsadsdasa"
+instance_ad                 = "GqIF:EU-FRANKFURT-1-AD-1"
+instance_shape              = "VM.Standard.E4.Flex"
+instance_image              = "ocid1.image.oc1.eu-frankfurt-1.aaaaaaaapbmaii43g6f7aewzhubzhdrq5tl3xspw7wzwfgjn5zb7mbzoge4a"
+instance_ocpus              = 1
+instance_memory_gbs         = 8
+instance_hostname           = "apache-airflow-1"
+
+ssh_public_key            = "ssh-rsa adassadsad123ac ssh-key-2023-07-20"
+assign_public_ip          = true
+create_required_policies  = true
+apache_airflow_admin_user = "admin"
+apache_airflow_admin_pass = ""
+oci_user_name             = "<tenancy_name>/oracleidentitycloudservice/<user_name>"
+oci_user_authtoken        = ""
+create_network            = true

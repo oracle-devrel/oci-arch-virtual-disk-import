@@ -1,0 +1,268 @@
+title: Import virtual disks into OCI block volumes
+description: Apache Airflow deployment to automate the import of virtual disks into OCI block volumes using object storage, events, functions and qemu-img.
+informationalText: Automate the import of virtual discks into OCI block volumes using Apache Airflow.
+schemaVersion: 1.1.0
+version: "20190304"
+
+# URL of Logo Icon used on Application Information tab. Logo must be 130x130 pixels.
+# (Optional)
+# logoUrl:
+
+
+locale: "en"
+variableGroups:
+  - title: "General configuration"
+    visible: false
+    variables:
+      - tenancy_ocid
+      - compartment_ocid
+      - region
+      - user_ocid
+      - fingerprint
+      - private_key_path
+      - default_freeform_tags
+      - default_defined_tags
+      - release
+      - block_vol_backup_policy_id
+      - instance_bootv_size_gbs
+
+  - title: "Apache Airflow Setup"
+    visible: true
+    variables:
+      - ${deployment_compartment_ocid}
+      - ${instance_ad}
+      - ${instance_hostname}
+      - ${instance_shape}
+      - ${instance_ocpus}
+      - ${instance_memory_gbs}
+      - ${instance_image}
+      - ${ssh_public_key}
+      - ${apache_airflow_admin_user}
+      - ${apache_airflow_admin_pass}
+      - ${create_required_policies}
+      - ${create_network}
+
+  - title: "Create new network resources"
+    variables:
+      - ${vcn_display_name}
+      - ${vcn_CIDR}
+      - ${public_subnet_CIDR}
+      - ${private_subnet_CIDR}
+      - ${assign_public_ip}
+    visible:
+      not:
+        - not:
+            - ${create_network}
+
+  - title: "Allow Apache Airflow console connection"
+    variables:
+      - ${allowed_source_cidr}
+    visible:
+      and:
+        - ${create_network}
+        - ${assign_public_ip}
+
+  - title: "Use existing network resources"
+    variables:
+      - ${deployment_vcn}
+      - ${deployment_subnet}      
+    visible:
+      not:
+        - ${create_network}
+
+  - title: "OCI DevOps Setup"
+    visible: true
+    variables:
+      - ${devops_project_name}
+      - ${oci_user_name}
+      - ${oci_user_authtoken}
+
+  - title: "Object Storage Setup"
+    visible: true
+    variables:
+      - ${bucket_name}
+      - ${enable_bucket_cleanup}
+
+variables:
+  deployment_compartment_ocid:
+    type: oci:identity:compartment:id
+    title: "Parent compartment for all the resources."
+    required: true
+
+  instance_ad:
+    type: oci:identity:availabilitydomain:name
+    title: "Availability domain for Apache Airflow instance."
+    dependsOn:
+      compartmentId: ${deployment_compartment_ocid}
+    visible: complexExpression
+    required: true
+
+  instance_hostname:
+    type: string
+    minLength: 3
+    maxLength: 25
+    pattern: ^[a-z][a-zA-Z0-9-]+$
+    title: "Hostname of Apache Airflow instance."
+    default: "apache-airflow-1"
+    required: true
+
+  instance_shape:
+    type: oci:core:instanceshape:name
+    title: Compute shape of Apache Airflow instance.
+    required: true
+    description: Tested with VM.Standard.E4.Flex shape.
+    pattern: ^.*?(Standard|Optimized).*?(3\.Flex|4\.Flex).*?$
+    dependsOn:
+      compartmentId: ${deployment_compartment_ocid}
+
+  instance_ocpus:
+    type: integer
+    title: Number of Apache Airflow instance.
+    required: true
+    description: 1 OCPUs = 2 Logical cores.
+    minimum: 1
+    default: 1
+
+  instance_memory_gbs:
+    type: integer
+    title: RAM amount in GBs for Apache Airflow instance.
+    required: true
+    minimum: 8
+    default: 8
+
+  instance_image:
+    title: OS Image for Apache Airflow instance.
+    description: Deployment was tested only with Oracle Linux 8.8.
+    required: true
+    type: oci:core:image:id
+    dependsOn:
+      compartmentId: ${deployment_compartment_ocid}
+      operatingSystem: "Oracle Linux"
+      operatingSystemVersion: "8"
+      shape: ${instance_shape}
+
+  ssh_public_key:
+    title: SSH Public Key
+    type: oci:core:ssh:publickey
+    required: true
+
+  apache_airflow_admin_user:
+    type: string
+    title: "Apache Airflow Admin User."
+    default: admin
+    required: true
+
+  apache_airflow_admin_pass:
+    type: password
+    title: "Apache Airflow Admin password."
+    required: true
+
+  create_network:
+    title: Create new OCI network resources for virtual disk import deployment?
+    type: boolean
+    required: true
+    default: true
+
+  vcn_display_name:
+    type: string
+    minLength: 3
+    maxLength: 25
+    pattern: ^[a-z][a-zA-Z0-9-]+$
+    title: "Name of the new VCN."
+    default: "apache-airflow-vcn"
+    required: true
+  
+  vcn_CIDR:
+    type: string
+    pattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)([/][1][6-9]|[/][2][0-9])$
+    title: "VCN CIDR block."
+    default: "10.0.0.0/16"
+    required: true
+  
+  public_subnet_CIDR:
+    type: string
+    pattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)([/][1][6-9]|[/][2][0-9])$
+    title: "Public Subnet CIDR block."
+    default: "10.0.0.0/24"
+    required: true  
+
+  private_subnet_CIDR:
+    type: string
+    pattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)([/][1][6-9]|[/][2][0-9])$
+    title: "Private Subnet CIDR block."
+    default: "10.0.1.0/24"
+    required: true  
+
+  assign_public_ip:
+    title: Assign public IP to the Apache Airflow instance?
+    type: boolean
+    required: false
+    default: false
+ 
+  allowed_source_cidr:
+    type: string
+    pattern: ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)([/][0-3][0-2]?|[/][1-2][0-9]|[/][0-9])$
+    title: "Source CIDR block allowed to connect to http://<apache-airflow-ip>:8080."
+    default: "0.0.0.0/0"
+    required: false  
+
+  deployment_vcn:
+    title: VCN to use for the virtual disk import deployment.
+    required: false
+    type: oci:core:vcn:id
+    dependsOn:
+      compartmentId: ${deployment_compartment_ocid}
+
+  deployment_subnet:
+    title: Subnet to use for the virtual disk import deployment.
+    description: Make sure that all connections are allowed within subnet.
+    type: oci:core:subnet:id
+    required: false
+    dependsOn:
+      hidePublicSubnet: true
+      compartmentId: ${deployment_compartment_ocid}
+      vcnId: ${deployment_vcn}
+
+  create_required_policies:
+    title: Create all the required policies required for the virtual disk import deployment?
+    type: boolean
+    required: true
+    default: true
+
+  devops_project_name:
+    type: string
+    title: "Name of the OCI DevOps Project."
+    default: virtual-disk-import-devops-project
+    required: true
+
+  oci_user_name:
+    type: string
+    title: "OCI DevOps User Name."
+    description: "https://docs.oracle.com/en-us/iaas/Content/devops/using/https_auth.htm"
+    required: true
+
+  oci_user_authtoken:
+    type: password
+    title: "OCI DevOps User Auth Token."
+    description: "https://docs.oracle.com/en-us/iaas/Content/devops/using/getting_started.htm#authtoken"
+    required: true
+
+  bucket_name:
+    type: string
+    title: "Name of the new bucket where virtual disk images will be uploaded."
+    pattern: ^[a-z][a-zA-Z0-9-]+$
+    default: block-volume-import-bucket
+    required: true
+
+  enable_bucket_cleanup:
+    title: Enable automatic deletion of file older than 7 days?
+    type: boolean
+    required: true
+    default: false
+
+outputGroups:
+- title: "Apache Airflow Instance"
+  outputs:
+    - apache_airflow_instance_hostname
+    - apache_airflow_instance_private_ip
+    - apache_airflow_instance_public_ip
