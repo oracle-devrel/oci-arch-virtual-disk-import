@@ -1,0 +1,19 @@
+---
+- name: Check if executed already
+  include_tasks: 0_check_execution_status.yml
+  
+- name: Prerequisites
+  include_tasks: 1_prerequisites_ol.yml
+  when: ansible_facts['distribution'] == "OracleLinux" 
+
+- name: Install Docker
+  include_tasks: 2_install_docker_ol.yml
+  when: (not already_executed.stdout) and ansible_facts['distribution'] == "OracleLinux" 
+
+- name: Deploy Apache Airflow
+  include_tasks: 3_deploy_apache_airflow.yml
+  when: (not already_executed.stdout) and ansible_facts['distribution'] == "OracleLinux" 
+
+- name: Configure Apache Airflow Application
+  include_tasks: 4_configure_application.yml
+  when: (not already_executed.stdout) and ansible_facts['distribution'] == "OracleLinux" 

@@ -1,0 +1,4 @@
+---
+- name: Expose Apache Airflow port
+  become: true
+  shell: firewall-cmd  --add-port 8080/tcp --zone public --permanent

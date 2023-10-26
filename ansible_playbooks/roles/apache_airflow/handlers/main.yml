@@ -1,0 +1,7 @@
+---
+- name: reload_nfs
+  become: true
+  service:
+    name: nfs-server
+    state: reloaded
+    enabled: true
