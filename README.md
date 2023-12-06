@@ -9,12 +9,12 @@ As organizations continue to migrate to the cloud, they often find themselves fa
 This is where the synergy of Apache Airflow, [qemu-img](https://qemu-project.gitlab.io/qemu/tools/qemu-img.html), OCI functions, OCI object storage, and event-driven architectures comes into play.
 
 This terraform stack will deploy and configure the following resources:
-- Compute Instance - running Apache Airflow.
-- Object Storage Bucket - to host the virtual disk image files.
-- OCI Function - to invoke execution of Apache Airflow DAG with the virtual disk image file metadata.
-- OCI DevOps project - to automate the build and deployment of functions.
-- OCI Events - to trigger function execution when new virtual disk images are uploaded to the bucket.
-- Required IAM dynamic-groups and policies to ensure solution functionality.
+* Compute Instance - running Apache Airflow.
+* Object Storage Bucket - to host the virtual disk image files.
+* OCI Function - to invoke execution of Apache Airflow DAG with the virtual disk image file metadata.
+* OCI DevOps project - to automate the build and deployment of functions.
+* OCI Events - to trigger function execution when new virtual disk images are uploaded to the bucket.
+* Required IAM dynamic-groups and policies to ensure solution functionality.
 
 The typical workflow would be as follows:
 1. The user will upload a new virtual disk to the Object Storage bucket. It is possible to customize the availability domain where the Block Volume will be created using the object `ad_number` [metadata](https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/managingobjects.htm#HeadersAndMetadata).
@@ -22,16 +22,17 @@ The typical workflow would be as follows:
 3. The function will fetch the virtual disk object metadata and call the Apache Airflow API to start DAG (Directed Acyclic Graph) execution.
 4. The Apache Airflow DAG will handle the import of the virtual disk image into OCI Block Volume in 14 steps. (some optional). 
 
-  Some of the most important steps are:
-  - Create a new worker compute instance that will handle the virtual disk import.
-  - Set up required tools on the new instance: `qemu-img`, `oci-cli`.
-  - Download the virtual disk image from the bucket to the worker instance.
-  - Determine the virtual disk image's real size using `qemu-img` and provision a new OCI Block Volume (named as the virtual disk image).
-  - Attach the OCI Block Volume to the worker compute instance.
-  - Write the virtual disk image content to the OCI Block Volume.
-  - Run `fsck` on the OCI Block Volume.
-  - Detach the OCI Block Volume.
-  - Terminate the worker instance.
+    Some of the most important steps are:
+    * Create a new worker compute instance that will handle the virtual disk import.
+    * Set up required tools on the new instance: `qemu-img`, `oci-cli`.
+    * Download the virtual disk image from the bucket to the worker instance.
+    * Determine the virtual disk image's real size using `qemu-img` and provision a new OCI Block Volume (named as the virtual disk image).
+    * Attach the OCI Block Volume to the worker compute instance.
+    * Write the virtual disk image content to the OCI Block Volume.
+    * Run `fsck` on the OCI Block Volume.
+    * Detach the OCI Block Volume.
+    * Terminate the worker instance.
+    
 5. Users can monitor the DAG execution by connecting to the Apache Airflow.
  
 ## Prerequisite
