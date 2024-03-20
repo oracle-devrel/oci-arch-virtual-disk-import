@@ -41,6 +41,10 @@
     state: latest
     extra_args: --user
 
+- name: Install docker python package
+  ansible.builtin.pip:
+    name: docker==6.1.3
+    extra_args: --user
 
 - name: Install docker-compose python package
   ansible.builtin.pip:

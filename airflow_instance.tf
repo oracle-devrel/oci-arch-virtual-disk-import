@@ -96,12 +96,18 @@ resource "null_resource" "copy_ansible_playbooks" {
   }
 
   provisioner "file" {
+    content      = tls_private_key.bastion_key.private_key_openssh
+    destination = "/home/opc/.ssh/id_rsa"
+  }
+
+  provisioner "file" {
     source      = "ansible_playbooks.zip"
     destination = "/home/opc/ansible_playbooks.zip"
   }
 
   provisioner "remote-exec" {
     inline = [
+      "chmod 400 /home/opc/.ssh/id_rsa",
       "sudo yum install -y python39-pip python39",
       "sudo update-alternatives  --set python3 /usr/bin/python3.9",
       "sudo update-alternatives  --set python /usr/bin/python3.9",
